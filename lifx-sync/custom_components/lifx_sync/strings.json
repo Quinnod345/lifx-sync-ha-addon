@@ -1,0 +1,22 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to LIFX Sync Add-on",
+        "description": "Enter the host and port where the LIFX Sync add-on is running. If using the Home Assistant add-on, the host is `localhost` and the port is `5050`.",
+        "data": {
+          "host": "Host",
+          "port": "Port"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect. Check that the LIFX Sync add-on is running and the host/port are correct.",
+      "no_lights": "Connected, but no lights were found. Run discovery from the add-on web UI first.",
+      "unknown": "Unexpected error. Check the Home Assistant logs."
+    },
+    "abort": {
+      "already_configured": "LIFX Sync is already configured."
+    }
+  }
+}

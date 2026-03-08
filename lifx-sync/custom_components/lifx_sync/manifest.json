@@ -1,0 +1,13 @@
+{
+  "domain": "lifx_sync",
+  "name": "LIFX Sync",
+  "version": "1.0.0",
+  "codeowners": ["@Quinnod345"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/Quinnod345/lifx-sync-ha-addon",
+  "iot_class": "local_polling",
+  "requirements": [],
+  "integration_type": "hub",
+  "single_config_entry": true
+}
