@@ -1,5 +1,5 @@
 name: LIFX Sync
-version: "1.0.0"
+version: "1.1.0"
 slug: lifx_sync
 description: Synced LAN control of LIFX lights with a hardened burst-and-verify engine
 url: https://github.com/Quinnod345/lifx-sync-ha-addon
