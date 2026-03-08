@@ -52,9 +52,15 @@ def load_lights(path: Path, labels: list[str] | None) -> list[dict[str, Any]]:
         raise ValueError(f"{path} contains entries missing mac or ip.")
     if not labels:
         return all_lights
-    normalized = {label.lower() for label in labels}
+    # Match exact label OR prefix — "Bar" matches "Bar 1", "Bar 2", etc.
+    normalized = [label.lower() for label in labels]
     filtered = [
-        light for light in all_lights if light.get("label", "").lower() in normalized
+        light for light in all_lights
+        if any(
+            light.get("label", "").lower() == term
+            or light.get("label", "").lower().startswith(term + " ")
+            for term in normalized
+        )
     ]
     if not filtered:
         available = sorted({light.get("label", "") for light in all_lights})
