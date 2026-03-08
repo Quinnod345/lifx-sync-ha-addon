@@ -18,5 +18,22 @@
     "abort": {
       "already_configured": "LIFX Sync is already configured."
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "LIFX Sync Settings",
+        "description": "Update the host/port or tick **Re-discover lights** to scan the network for new or renamed bulbs. The integration will reload automatically when you save.",
+        "data": {
+          "host": "Host",
+          "port": "Port",
+          "rediscover": "Re-discover lights (scans network, updates groups)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to the add-on. Check that it is running.",
+      "unknown": "Unexpected error during discovery. Check the Home Assistant logs."
+    }
   }
 }
