@@ -9,29 +9,17 @@ with guaranteed delivery confirmed per-bulb.
 Why ON lags but OFF is perfect
 -------------------------------
 Power-OFF is instantaneous in bulb firmware — it just cuts the LED driver.
-Power-ON is slower because each bulb independently:
-  1. Boots its LED driver
-  2. Reads the last color/brightness state from onboard flash memory
-  3. Ramps up to that state
+Power-ON triggers a flash read: each bulb independently reads its last
+color/brightness from onboard flash, then ramps up. That takes 10–200 ms
+per bulb and varies, causing stagger even with a simultaneous UDP blast.
 
-That flash read + ramp takes a variable 10–200 ms per bulb and happens AFTER
-the UDP packet lands — so even a perfectly synchronised blast produces visible
-stagger on power-on.
-
-The fix (Phase 0 — Color Prime):
-    While the bulbs are still OFF, blast a SetColor packet to every bulb first.
-    This writes the target color into the bulb's active RAM without turning it on.
-    When the subsequent SetPower ON packet arrives, the bulb already has its color
-    loaded in RAM and can fire the LED driver instantly — no flash read needed.
-    Result: power-on timing matches power-off timing.
+The fix: use LightSetState (type 101) for power-on instead of LightSetPower
+(type 117). LightSetState carries both the power level AND the color in a
+single packet. The bulb applies them atomically from the packet payload —
+no flash read needed — so turn-on fires as fast as turn-off.
 
 Phases
 ------
-Phase 0 — Color prime (power-on only, parallel raw UDP blast)
-    Pre-build SetColor packets and blast them to all bulbs while they are still
-    off. This primes each bulb's color RAM so the subsequent power-on requires
-    no flash read. Uses warm white (2700K, full brightness) by default.
-
 Phase 1 — Pre-warm (parallel threads, unsynchronised)
     Each thread fires one rapid set_power() to wake the bulb's UDP stack and
     clear any in-flight transition state. Light objects are constructed here
@@ -41,6 +29,8 @@ Phase 2 — Raw UDP blast (single tight loop, barrier-gated)
     All workers wait at a barrier. On release, a single UDP socket fires
     BLAST_ROUNDS full passes across every bulb IP in one tight loop with
     zero inter-bulb gap. The OS kernel queues all packets simultaneously.
+    For power-on, each packet is LightSetState (color+power atomically).
+    For power-off, each packet is LightSetPower (minimal payload).
 
 Phase 3 — Verify + confirmed retry (parallel threads)
     Each worker reads back power state and retries with a confirmed
@@ -82,13 +72,10 @@ VERIFY_RETRY_DELAY = 0.25
 # UDP port used by the LIFX LAN protocol.
 LIFX_PORT = 56700
 
-# Color used for the power-on prime blast.
+# Color embedded in the power-on LightSetState packet.
 # HSBK: hue=0, saturation=0 (white), brightness=65535 (full), kelvin=2700 (warm)
-PRIME_HSBK = (0, 0, 65535, 2700)
-
-# How long to wait after the color prime before firing the power-on blast.
-# Gives bulbs time to write the color to RAM before we tell them to turn on.
-PRIME_SETTLE = 0.05  # 50 ms
+# The bulb applies this atomically with the power-on, no flash read needed.
+ON_HSBK = (0, 0, 65535, 2700)
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -131,23 +118,38 @@ def _header(size: int, msg_type: int, mac_str: str, source_id: int) -> bytes:
 
 
 def _build_set_power_packet(mac_str: str, power: int, source_id: int) -> bytes:
-    """LightSetPower (type 117): 36-byte header + 6-byte payload."""
+    """LightSetPower (type 117): 36-byte header + 6-byte payload. Used for OFF."""
     hdr = _header(42, 117, mac_str, source_id)
     payload = struct.pack("<HI", power, 0)  # level, duration=0 (instant)
     return hdr + payload
 
 
-def _build_set_color_packet(
-    mac_str: str, hsbk: tuple[int, int, int, int], source_id: int
+def _build_set_state_packet(
+    mac_str: str, hsbk: tuple[int, int, int, int], power: int, source_id: int
 ) -> bytes:
-    """LightSetColor (type 102): 36-byte header + 13-byte payload.
+    """LightSetState (type 101): sets color+power atomically in one packet.
 
-    Payload: uint8 reserved, uint16 hue, uint16 sat, uint16 brightness,
-             uint16 kelvin, uint32 duration.
+    By carrying both color and power level in the same message, the bulb
+    applies them from the packet payload directly — no flash read needed.
+    This is why power-on with LightSetState fires as fast as power-off.
+
+    Payload (52 bytes total, 16 payload):
+        uint8[2] reserved, uint16 hue, uint16 sat, uint16 brightness,
+        uint16 kelvin, uint16 reserved, uint16 power, uint8[32] label (empty),
+        uint64 reserved
     """
-    hdr = _header(49, 102, mac_str, source_id)
+    hdr = _header(107, 101, mac_str, source_id)
     h, s, b, k = hsbk
-    payload = struct.pack("<BHHHHHI", 0, h, s, b, k, 0, 0)
+    payload = struct.pack(
+        "<2sHHHHH2sH32s8s",
+        b"\x00\x00",       # reserved
+        h, s, b, k,        # hue, sat, brightness, kelvin
+        0,                 # reserved
+        power,             # power level
+        b"\x00\x00",       # reserved
+        b"\x00" * 32,      # label (empty = don't change)
+        b"\x00" * 8,       # reserved
+    )
     return hdr + payload
 
 
@@ -310,23 +312,20 @@ def run_sync(
     source_id = random.randrange(2, 1 << 32)
     power_on = target_power == 65535
 
-    # ── Phase 0: color prime (power-on only) ──────────────────────────────────
-    # Blast SetColor to every bulb while they are still off so they pre-load
-    # the target color into RAM. When SetPower ON arrives they fire instantly
-    # without needing a flash read — this is why OFF is faster than ON normally.
+    # For power-on, use LightSetState (type 101) which carries color+power
+    # atomically in one packet — no flash read on the bulb side, so all bulbs
+    # fire their LED driver at the same time as they would for power-off.
+    # For power-off, use the minimal LightSetPower (type 117) packet.
     if power_on:
-        color_packets = [
-            (light["ip"], _build_set_color_packet(light["mac"], PRIME_HSBK, source_id))
+        power_packets: list[tuple[str, bytes]] = [
+            (light["ip"], _build_set_state_packet(light["mac"], ON_HSBK, target_power, source_id))
             for light in lights_data
         ]
-        _blast(color_packets)
-        time.sleep(PRIME_SETTLE)
-
-    # Pre-build power packets before any threads start.
-    power_packets: list[tuple[str, bytes]] = [
-        (light["ip"], _build_set_power_packet(light["mac"], target_power, source_id))
-        for light in lights_data
-    ]
+    else:
+        power_packets = [
+            (light["ip"], _build_set_power_packet(light["mac"], target_power, source_id))
+            for light in lights_data
+        ]
 
     n = len(lights_data)
     pre_warm_barrier = threading.Barrier(n + 1)
