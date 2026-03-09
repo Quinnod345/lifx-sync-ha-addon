@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, urlparse
 
 from lifxlan import LifxLAN
 
-from discover import discover_lights
+from discover import run_discovery
 from sync_core import default_lights_file, load_lights, run_sync
 
 
@@ -56,8 +56,19 @@ def write_lights_cache(lights: list[dict[str, str]]) -> None:
 
 def discover_and_cache() -> list[dict[str, str]]:
     lan = LifxLAN()
-    lights = discover_lights(lan)
-    lights.sort(key=lambda item: (item["label"].lower(), item["ip"]))
+    # Load existing cache so offline lights are preserved across re-discovers.
+    existing: dict[str, dict[str, str]] = {}
+    if LIGHTS_FILE.exists():
+        try:
+            data = json.loads(LIGHTS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                existing = {e["mac"]: e for e in data if "mac" in e}
+        except Exception:
+            pass
+
+    discovered = run_discovery(lan)
+    merged = {**existing, **discovered}
+    lights = sorted(merged.values(), key=lambda e: (e["label"].lower(), e["ip"]))
     write_lights_cache(lights)
     return lights
 
