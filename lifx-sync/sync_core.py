@@ -6,30 +6,46 @@ Strategy
 Goal: every bulb fires as close to simultaneously as physically possible,
 with guaranteed delivery confirmed per-bulb.
 
+Why ON lags but OFF is perfect
+-------------------------------
+Power-OFF is instantaneous in bulb firmware — it just cuts the LED driver.
+Power-ON is slower because each bulb independently:
+  1. Boots its LED driver
+  2. Reads the last color/brightness state from onboard flash memory
+  3. Ramps up to that state
+
+That flash read + ramp takes a variable 10–200 ms per bulb and happens AFTER
+the UDP packet lands — so even a perfectly synchronised blast produces visible
+stagger on power-on.
+
+The fix (Phase 0 — Color Prime):
+    While the bulbs are still OFF, blast a SetColor packet to every bulb first.
+    This writes the target color into the bulb's active RAM without turning it on.
+    When the subsequent SetPower ON packet arrives, the bulb already has its color
+    loaded in RAM and can fire the LED driver instantly — no flash read needed.
+    Result: power-on timing matches power-off timing.
+
+Phases
+------
+Phase 0 — Color prime (power-on only, parallel raw UDP blast)
+    Pre-build SetColor packets and blast them to all bulbs while they are still
+    off. This primes each bulb's color RAM so the subsequent power-on requires
+    no flash read. Uses warm white (2700K, full brightness) by default.
+
 Phase 1 — Pre-warm (parallel threads, unsynchronised)
-    Each thread constructs the raw UDP packet bytes for its bulb and fires
-    one rapid set_power() to wake the bulb's radio. No work happens after
-    the barrier — pre-building packets here means zero CPU between barrier
-    release and first byte on the wire.
+    Each thread fires one rapid set_power() to wake the bulb's UDP stack and
+    clear any in-flight transition state. Light objects are constructed here
+    so no work remains between barrier release and the blast.
 
 Phase 2 — Raw UDP blast (single tight loop, barrier-gated)
-    All threads wait at the barrier.  The main thread is also waiting.
-    On release, a SINGLE dedicated sender thread immediately loops over
-    all pre-built packets and fires them from one socket as fast as the
-    OS allows — no inter-packet gaps, no per-bulb threading overhead.
-    The sender sends BLAST_ROUNDS full passes to saturate any single-
-    packet loss without adding latency between bulbs.
+    All workers wait at a barrier. On release, a single UDP socket fires
+    BLAST_ROUNDS full passes across every bulb IP in one tight loop with
+    zero inter-bulb gap. The OS kernel queues all packets simultaneously.
 
 Phase 3 — Verify + confirmed retry (parallel threads)
-    Each worker thread reads back power state and retries with a
-    confirmed (ack-required) send if it doesn't match. Up to
-    VERIFY_RETRIES cycles with a short settle between each.
-
-Why raw UDP instead of lifxlan set_power()
-    lifxlan's set_power() opens and closes a socket per call, acquires
-    Python locks, and does bookkeeping between every send.  For maximum
-    simultaneity we pre-build all the packet bytes, open one socket, and
-    write all of them in a single tight loop with nothing in between.
+    Each worker reads back power state and retries with a confirmed
+    (ack-required) send if it doesn't match target. Up to VERIFY_RETRIES
+    cycles with a short settle between each.
 """
 
 from __future__ import annotations
@@ -41,7 +57,7 @@ import socket
 import struct
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -51,13 +67,10 @@ from lifxlan.errors import WorkflowException
 
 # ── tunables ──────────────────────────────────────────────────────────────────
 
-# How many full passes to blast to every bulb in the synchronised burst.
-# Each pass sends one packet to every bulb.  3 passes = 3 packets per bulb
-# delivered as fast as the OS socket buffer allows, with zero inter-bulb gap.
+# Full passes of the raw UDP blast per bulb.
 BLAST_ROUNDS = 5
 
 # Seconds to wait after the blast before the first verify read.
-# Bulbs need a moment to process their last received packet.
 BLAST_SETTLE = 0.15
 
 # Max verify+retry cycles per bulb.
@@ -66,8 +79,16 @@ VERIFY_RETRIES = 5
 # Seconds between verify cycles.
 VERIFY_RETRY_DELAY = 0.25
 
-# UDP broadcast port used by the LIFX LAN protocol.
+# UDP port used by the LIFX LAN protocol.
 LIFX_PORT = 56700
+
+# Color used for the power-on prime blast.
+# HSBK: hue=0, saturation=0 (white), brightness=65535 (full), kelvin=2700 (warm)
+PRIME_HSBK = (0, 0, 65535, 2700)
+
+# How long to wait after the color prime before firing the power-on blast.
+# Gives bulbs time to write the color to RAM before we tell them to turn on.
+PRIME_SETTLE = 0.05  # 50 ms
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -83,52 +104,76 @@ class BulbResult:
     aborted: bool = False
 
 
-# ── LIFX raw packet builder ───────────────────────────────────────────────────
-# Builds a minimal LightSetPower (type 117) packet addressed to a specific MAC.
-# Ref: https://lan.developer.lifx.com/docs/packet-contents
+# ── LIFX raw packet builders ──────────────────────────────────────────────────
 
 def _mac_bytes(mac_str: str) -> bytes:
-    """Convert "d0:73:d5:a1:15:fb" → 6-byte little-endian bytes + 2 zero pad."""
-    parts = [int(x, 16) for x in mac_str.split(":")]
-    return bytes(parts) + b"\x00\x00"  # LIFX target is 8 bytes
+    """Convert "d0:73:d5:a1:15:fb" → 8-byte LIFX target field."""
+    return bytes(int(x, 16) for x in mac_str.split(":")) + b"\x00\x00"
+
+
+def _header(size: int, msg_type: int, mac_str: str, source_id: int) -> bytes:
+    """Build the 36-byte LIFX frame + frame-address + protocol header."""
+    protocol_flags = 0x1400  # protocol=1024, addressable=1, tagged=0, origin=0
+    target = _mac_bytes(mac_str)
+    return struct.pack(
+        "<HHI8s6sBB8sHH",
+        size,
+        protocol_flags,
+        source_id,
+        target,
+        b"\x00" * 6,  # reserved
+        0x00,          # res_required | ack_required = 0 (rapid)
+        0,             # sequence
+        b"\x00" * 8,  # reserved
+        msg_type,
+        0,             # reserved
+    )
 
 
 def _build_set_power_packet(mac_str: str, power: int, source_id: int) -> bytes:
-    """Build a raw LIFX LightSetPower (type=117) UDP packet.
+    """LightSetPower (type 117): 36-byte header + 6-byte payload."""
+    hdr = _header(42, 117, mac_str, source_id)
+    payload = struct.pack("<HI", power, 0)  # level, duration=0 (instant)
+    return hdr + payload
 
-    Frame:
-        uint16 size, uint16 protocol|addressable|tagged|origin,
-        uint32 source
-    Frame address:
-        uint8[8] target (mac + 2 zero), uint8[6] reserved,
-        uint8 res_required|ack_required, uint8 sequence
-    Protocol header:
-        uint64 reserved, uint16 type, uint16 reserved
-    Payload:
-        uint16 level (0 or 65535), uint32 duration (0 = instant)
+
+def _build_set_color_packet(
+    mac_str: str, hsbk: tuple[int, int, int, int], source_id: int
+) -> bytes:
+    """LightSetColor (type 102): 36-byte header + 13-byte payload.
+
+    Payload: uint8 reserved, uint16 hue, uint16 sat, uint16 brightness,
+             uint16 kelvin, uint32 duration.
     """
-    size = 42  # 36 header + 6 payload
-    # protocol=1024, addressable=1, tagged=0, origin=0  → 0x1400
-    protocol_flags = 0x1400
-    target = _mac_bytes(mac_str)
-    reserved6 = b"\x00" * 6
-    res_ack = 0x00           # rapid: no ack, no response requested
-    sequence = 0
-    reserved8 = b"\x00" * 8
-    msg_type = 117            # LightSetPower
-    reserved2 = b"\x00\x00"
-    duration = 0              # instant transition
+    hdr = _header(49, 102, mac_str, source_id)
+    h, s, b, k = hsbk
+    payload = struct.pack("<BHHHHHI", 0, h, s, b, k, 0, 0)
+    return hdr + payload
 
-    header = struct.pack(
-        "<HHI"          # size, protocol_flags, source_id
-        "8s6sBB"        # target, reserved6, res_ack, sequence
-        "8sHH",         # reserved8, msg_type, reserved2
-        size, protocol_flags, source_id,
-        target, reserved6, res_ack, sequence,
-        reserved8, msg_type, 0,
-    )
-    payload = struct.pack("<HI", power, duration)
-    return header + payload
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _blast(packets: list[tuple[str, bytes]]) -> None:
+    """Open one UDP socket and fire BLAST_ROUNDS passes as fast as possible."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
+    sock.setblocking(False)
+    try:
+        sock.bind(("", 0))
+    except OSError:
+        sock.setblocking(True)
+    try:
+        for _ in range(BLAST_ROUNDS):
+            for ip, pkt in packets:
+                try:
+                    sock.sendto(pkt, (ip, LIFX_PORT))
+                except BlockingIOError:
+                    sock.setblocking(True)
+                    sock.sendto(pkt, (ip, LIFX_PORT))
+                    sock.setblocking(False)
+    finally:
+        sock.close()
 
 
 def load_lights(path: Path, labels: list[str] | None) -> list[dict[str, Any]]:
@@ -143,7 +188,6 @@ def load_lights(path: Path, labels: list[str] | None) -> list[dict[str, Any]]:
         raise ValueError(f"{path} contains entries missing mac or ip.")
     if not labels:
         return all_lights
-    # Match exact label OR prefix — "Bar" matches "Bar 1", "Bar 2", etc.
     normalised = [lbl.lower() for lbl in labels]
     filtered = [
         l for l in all_lights
@@ -176,7 +220,7 @@ def _worker(
     results_lock: threading.Lock,
     abort: threading.Event,
     progress_cb: Callable[[str, str, str], None] | None,
-    packet: bytes,                 # pre-built raw UDP packet for this bulb
+    packet: bytes,
 ) -> None:
     label = light_info.get("label", light_info["ip"])
     ip    = light_info["ip"]
@@ -187,7 +231,6 @@ def _worker(
             progress_cb(ip, label, status)
 
     try:
-        # Phase 1 — pre-warm via lifxlan (handles socket setup per bulb)
         if abort.is_set():
             result.aborted = True
             with results_lock: results.append(result)
@@ -200,10 +243,8 @@ def _worker(
         except WorkflowException:
             pass
 
-        # Signal pre-warm done, wait for all peers.
         pre_warm_barrier.wait()
 
-        # Phase 2 — raw UDP blast handled by the central sender, just record time.
         blast_barrier.wait()
         result.sent_at = time.perf_counter()
 
@@ -212,7 +253,6 @@ def _worker(
             with results_lock: results.append(result)
             return
 
-        # Phase 3 — verify + confirmed retry
         time.sleep(BLAST_SETTLE)
 
         confirmed = False
@@ -268,20 +308,29 @@ def run_sync(
         abort = threading.Event()
 
     source_id = random.randrange(2, 1 << 32)
+    power_on = target_power == 65535
 
-    # Pre-build every raw UDP packet and pair with (ip, packet) before any
-    # threads start — zero work between barrier release and first sendto().
-    packets: list[tuple[str, bytes]] = [
+    # ── Phase 0: color prime (power-on only) ──────────────────────────────────
+    # Blast SetColor to every bulb while they are still off so they pre-load
+    # the target color into RAM. When SetPower ON arrives they fire instantly
+    # without needing a flash read — this is why OFF is faster than ON normally.
+    if power_on:
+        color_packets = [
+            (light["ip"], _build_set_color_packet(light["mac"], PRIME_HSBK, source_id))
+            for light in lights_data
+        ]
+        _blast(color_packets)
+        time.sleep(PRIME_SETTLE)
+
+    # Pre-build power packets before any threads start.
+    power_packets: list[tuple[str, bytes]] = [
         (light["ip"], _build_set_power_packet(light["mac"], target_power, source_id))
         for light in lights_data
     ]
 
-    # Two barriers:
-    #   pre_warm_barrier — releases when all workers finish Phase 1
-    #   blast_barrier    — releases when the sender is ready to fire
     n = len(lights_data)
-    pre_warm_barrier = threading.Barrier(n + 1)  # n workers + main
-    blast_barrier    = threading.Barrier(n + 1)  # n workers + sender
+    pre_warm_barrier = threading.Barrier(n + 1)
+    blast_barrier    = threading.Barrier(n + 1)
 
     results: list[BulbResult] = []
     results_lock = threading.Lock()
@@ -298,43 +347,18 @@ def run_sync(
             ),
             daemon=True,
         )
-        for light, (_, pkt) in zip(lights_data, packets)
+        for light, (_, pkt) in zip(lights_data, power_packets)
     ]
 
     for t in threads:
         t.start()
 
-    # Wait for all pre-warms to complete, then open the blast socket.
     pre_warm_barrier.wait()
 
-    # Open one UDP socket for the entire blast — reusing one socket eliminates
-    # per-send socket overhead and keeps the kernel send queue hot.
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)  # 1 MB send buffer
-    sock.setblocking(False)
-    try:
-        sock.bind(("", 0))
-    except OSError:
-        sock.setblocking(True)
-
-    # Release all workers simultaneously, then immediately blast.
     blast_barrier.wait()
     dispatch_start = time.perf_counter()
 
-    # BLAST_ROUNDS full passes: packet for bulb 0, bulb 1, ... bulb N-1, repeat.
-    # All sends happen in a single tight loop with no sleep/yield between them.
-    for _ in range(BLAST_ROUNDS):
-        for ip, pkt in packets:
-            try:
-                sock.sendto(pkt, (ip, LIFX_PORT))
-            except BlockingIOError:
-                # Send buffer momentarily full — block briefly and retry once.
-                sock.setblocking(True)
-                sock.sendto(pkt, (ip, LIFX_PORT))
-                sock.setblocking(False)
-
-    sock.close()
+    _blast(power_packets)
 
     for t in threads:
         t.join()
