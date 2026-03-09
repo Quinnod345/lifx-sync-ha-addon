@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, urlparse
 from lifxlan import LifxLAN
 
 from discover import run_discovery
+from ha_state import fetch_group_hsbk
 from sync_core import default_lights_file, load_lights, run_sync
 
 
@@ -133,12 +134,23 @@ def worker_loop() -> None:
             {"action": job.action, "label": job.label, "total": len(lights_data)},
         )
 
+        # For power-on, fetch each bulb's last-known color/brightness from HA
+        # so lights restore to their previous state rather than defaulting to
+        # warm white. Falls back gracefully if HA is unreachable.
+        hsbk_map = None
+        if target_power == POWER_ON:
+            try:
+                hsbk_map = fetch_group_hsbk(lights_data, job.label)
+            except Exception:
+                pass  # non-fatal — run_sync falls back to ON_HSBK
+
         with _run_lock:
             all_ok, results = run_sync(
                 lights_data,
                 target_power,
                 abort=job.abort,
                 progress_cb=bulb_progress,
+                hsbk_map=hsbk_map,
             )
 
         confirmed = sum(1 for result in results if result.ok)

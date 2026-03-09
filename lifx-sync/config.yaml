@@ -1,5 +1,5 @@
 name: LIFX Sync
-version: "1.6.1"
+version: "1.7.0"
 slug: lifx_sync
 description: Synced LAN control of LIFX lights with a hardened burst-and-verify engine
 url: https://github.com/Quinnod345/lifx-sync-ha-addon
@@ -12,6 +12,7 @@ arch:
 boot: auto
 init: false
 host_network: true
+hassio_api: true
 ports:
   5050/tcp: 5050
 ports_description:
