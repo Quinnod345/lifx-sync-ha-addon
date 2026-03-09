@@ -138,17 +138,17 @@ def _build_set_state_packet(
         uint16 kelvin, uint16 reserved, uint16 power, uint8[32] label (empty),
         uint64 reserved
     """
-    hdr = _header(107, 101, mac_str, source_id)
+    hdr = _header(92, 101, mac_str, source_id)
     h, s, b, k = hsbk
     payload = struct.pack(
-        "<2sHHHHH2sH32s8s",
-        b"\x00\x00",       # reserved
-        h, s, b, k,        # hue, sat, brightness, kelvin
-        0,                 # reserved
-        power,             # power level
-        b"\x00\x00",       # reserved
-        b"\x00" * 32,      # label (empty = don't change)
-        b"\x00" * 8,       # reserved
+        "<2sHHHHHHH32sQ",
+        b"\x00\x00",   # reserved
+        h, s, b, k,    # hue, sat, brightness, kelvin
+        0,             # reserved (uint16)
+        power,         # power level (uint16)
+        0,             # reserved (uint16) — pad to align label
+        b"\x00" * 32,  # label (empty = don't change)
+        0,             # reserved (uint64)
     )
     return hdr + payload
 
