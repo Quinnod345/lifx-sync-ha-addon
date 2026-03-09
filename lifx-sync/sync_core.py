@@ -304,8 +304,18 @@ def run_sync(
     verbose: bool = False,
     abort: threading.Event | None = None,
     progress_cb: Callable[[str, str, str], None] | None = None,
+    hsbk_map: dict[str, tuple[int, int, int, int]] | None = None,
 ) -> tuple[bool, list[BulbResult]]:
-    """Dispatch set_power(target_power) to all lights and verify delivery."""
+    """Dispatch set_power(target_power) to all lights and verify delivery.
+
+    Args:
+        lights_data:  list of {"mac", "ip", "label"} dicts
+        target_power: 65535 (on) or 0 (off)
+        hsbk_map:     optional dict mapping MAC → HSBK tuple for power-on.
+                      When provided, each bulb gets its own last-known color
+                      state from HA instead of the default warm white.
+                      Falls back to ON_HSBK for any MAC not in the map.
+    """
     if abort is None:
         abort = threading.Event()
 
@@ -315,10 +325,19 @@ def run_sync(
     # For power-on, use LightSetState (type 101) which carries color+power
     # atomically in one packet — no flash read on the bulb side, so all bulbs
     # fire their LED driver at the same time as they would for power-off.
+    # Each bulb uses its own last-known HSBK from HA if hsbk_map is provided.
     # For power-off, use the minimal LightSetPower (type 117) packet.
     if power_on:
         power_packets: list[tuple[str, bytes]] = [
-            (light["ip"], _build_set_state_packet(light["mac"], ON_HSBK, target_power, source_id))
+            (
+                light["ip"],
+                _build_set_state_packet(
+                    light["mac"],
+                    (hsbk_map or {}).get(light["mac"], ON_HSBK),
+                    target_power,
+                    source_id,
+                ),
+            )
             for light in lights_data
         ]
     else:
